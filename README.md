@@ -224,6 +224,51 @@ curl -s http://localhost:8080/api/v1/health
 curl -s http://localhost:8080/api/v1/status
 ```
 
+### 8. 审计取证：生成追溯包（本轮新增）
+
+按 **设备编号 + 带时区测量时间的左闭右开区间 `[time_from, time_to)` + 已提交版本 `at_version`** 生成追溯包。包只收录该版本前（含）已提交（`submitted_at_version <= at_version`）、设备相同且测量时刻落在区间内的读数；每条读数给出在 `at_version` 视角下的结论与全部候选证书快照。
+
+```bash
+# 生成（或幂等复用）追溯包；page_size 为分段大小，缺省取服务默认值
+curl -s -X POST http://localhost:8080/api/v1/audit/packages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_no": "DEV-A",
+    "time_from": "2026-01-01T00:00:00Z",
+    "time_to":   "2026-07-01T00:00:00Z",
+    "at_version": 2,
+    "page_size": 100
+  }'
+```
+
+返回清单：筛选条件 `criteria`、`at_version`、`total_count`、固定分段表 `segments`（含每段偏移与段摘要）、`entries_digest`（全量条目摘要）、`package_digest`（清单摘要）、`canonicalization`（规范化规则）与 `package_id`。区间内无匹配读数时返回 `total_count=0`、无分段的**空包**（不报错）。
+
+```bash
+# 分段获取冻结条目（段号从 0 起；按段序拼接即可无遗漏、无重复地复原整包）
+curl -s http://localhost:8080/api/v1/audit/packages/AP_ID/segments/0
+curl -s http://localhost:8080/api/v1/audit/packages/AP_ID/segments/1
+
+# 查包清单（摘要、分段表）
+curl -s http://localhost:8080/api/v1/audit/packages/AP_ID
+
+# 按筛选条件+版本定位既有包（不存在返回 404，不会隐式生成）
+curl -s -G http://localhost:8080/api/v1/audit/packages/find \
+  --data-urlencode device_no=DEV-A \
+  --data-urlencode 'time_from=2026-01-01T00:00:00Z' \
+  --data-urlencode 'time_to=2026-07-01T00:00:00Z' \
+  --data-urlencode at_version=2
+```
+
+时间可带任意时区（如 `2026-01-01T08:00:00+08:00`），服务端归一化为 UTC；等价条件复用同一个包。**完整性摘要的规范化规则**随包在 `canonicalization` 字段给出（规则版本 `1`）：
+
+- JSON：UTF-8、紧凑分隔符、非 ASCII 不转义、对象键按 Unicode 码点排序（`json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)`）；时间一律 UTC 定长 `YYYY-MM-DDTHH:MM:SS.ffffffZ`；
+- 条目顺序：`measured_at` 升序，再按 `reading_no` 升序；候选证书按 `certificate_no`、`version_seq` 排序；
+- `segment_digest = SHA-256(段内各条目规范化 JSON 字节按序拼接)`，小写十六进制；
+- `entries_digest = SHA-256(全部条目规范化 JSON 字节按序拼接)`，空集为 `SHA-256("") = e3b0c442…`；
+- `package_digest = SHA-256(规范化清单 JSON 的 UTF-8 字节)`。审计方仅凭 HTTP 取回的 JSON 即可独立复算全部摘要。
+
+追溯包是**创建时冻结**的只追加快照：生成在单条 `BEGIN IMMEDIATE` 事务内完成，期间的新提交、证书纠正或撤销被写锁阻塞，不会混入；生成之后的任何变更也不影响既有包。相同筛选条件与版本唯一对应一个包，内容与摘要必然一致（重复请求返回同一 `package_id`，`reused=true`）。追溯包是审计派生物，不占用 `versions` 表的全局领域版本号。
+
 ---
 
 ## 六、HTTP 接口一览
@@ -241,9 +286,13 @@ curl -s http://localhost:8080/api/v1/status
 | GET  | `/api/v1/readings/{reading_no}` | 读数结论（默认当前版本，`at_version` 查历史） |
 | GET  | `/api/v1/versions` | 全局单调版本流水 |
 | GET  | `/api/v1/requests/{request_id}` | 按请求标识追溯 |
+| POST | `/api/v1/audit/packages` | 生成（幂等复用）审计取证追溯包 |
+| GET  | `/api/v1/audit/packages/{package_id}` | 追溯包清单与摘要 |
+| GET  | `/api/v1/audit/packages/{package_id}/segments/{index}` | 分段获取冻结条目（段号从 0 起） |
+| GET  | `/api/v1/audit/packages/find` | 按条件+版本定位既有包（只读，404=无） |
 | GET  | `/api/v1/health` | 健康检查 |
 
-主要状态码：`200` 成功；`404` 未知目标（证书 / 读数 / 请求）；`409` 请求标识冲突、证书已存在 / 已撤销、读数已存在；`422` 参数校验失败（含无效时间区间、范围倒置、缺时区等）。
+主要状态码：`200` 成功；`201` 追溯包创建 / 幂等复用；`404` 未知目标（证书 / 读数 / 请求 / 追溯包 / 分段）；`409` 请求标识冲突、证书已存在 / 已撤销、读数已存在；`422` 参数校验失败（含无效时间区间、范围倒置、缺时区、版本越界、页大小越界等）。
 
 ---
 
@@ -254,6 +303,7 @@ curl -s http://localhost:8080/api/v1/status
 - **版本视角查询**：证书在版本 V 有效 ⇔ 其内容版本 `created_at_version <= V` 且（`superseded_at_version` 为空或 `> V`），且测量时刻落在 `[valid_from, valid_to)`。
 - **事务与并发**：所有写操作在单条 `BEGIN IMMEDIATE` 事务内完成「幂等判定 → 业务校验 → 落库」，任何错误整体回滚；WAL 模式支持读写并发。
 - **幂等指纹**：对归一化（UTC 化）后的请求体做排序 JSON 指纹；相同 `request_id` + 指纹返回首次响应，`request_id` 复用且指纹不同则拒绝。
+- **审计追溯包冻结模型**：`audit_packages`（主档 + 规范化清单原文 + 两层摘要）与 `audit_package_entries`（逐条目规范化快照）只追加；创建在单条 `BEGIN IMMEDIATE` 事务内选数、按固定版本评估结论、分段并落库，`(device_no, time_from, time_to, at_version)` 唯一约束保证同条件+版本唯一且摘要一致；大量条目经固定 `page_size` 分段，`segment_index` 连续、偏移确定，拼接无重无漏。
 
 ---
 
@@ -264,4 +314,4 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-测试通过 TestClient 覆盖：四种结论、左闭右开边界、纠正 / 撤销的结论联动、旧版本可追溯、幂等重放、标识冲突、无效区间、未知目标、批次部分变更防护与多时区归一化。
+测试通过 TestClient 覆盖：四种结论、左闭右开边界、纠正 / 撤销的结论联动、旧版本可追溯、幂等重放、标识冲突、无效区间、未知目标、批次部分变更防护与多时区归一化；审计追溯包（`test_audit.py`）覆盖版本截止选数与半开边界、固定版本结论与全部候选证书快照、空包、分段拼接无重无漏、摘要按声明的规范化规则独立复算、同条件+版本幂等一致、生成后的提交 / 纠正 / 撤销不混入旧包、版本越界 / 无效区间明确报错且不留半成品。

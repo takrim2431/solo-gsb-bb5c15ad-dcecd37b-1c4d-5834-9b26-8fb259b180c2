@@ -123,3 +123,21 @@ class ReadingSubmitRequest(BaseModel):
         if len(set(nos)) != len(nos):
             raise ValueError("duplicate reading_no within the same request")
         return self
+
+
+class AuditPackageRequest(BaseModel):
+    """审计取证追溯包：设备编号 + 带时区的半开测量时间区间 + 已提交版本。"""
+
+    device_no: str = Field(min_length=1, max_length=128)
+    time_from: UtcDatetime
+    time_to: UtcDatetime
+    at_version: int = Field(ge=1, description="结论所依据的已提交版本视角")
+    page_size: Optional[int] = Field(
+        default=None, ge=1, description="分段大小；缺省取服务默认值"
+    )
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "AuditPackageRequest":
+        if self.time_from >= self.time_to:
+            raise ValueError("time_from must be earlier than time_to (half-open interval [time_from, time_to))")
+        return self

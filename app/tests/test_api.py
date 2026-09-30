@@ -22,6 +22,12 @@ from app.main import app  # noqa: E402
 
 @pytest.fixture(scope="module")
 def client():
+    # 在 fixture 内再次固定，避免同进程其它测试模块在收集阶段覆盖环境变量
+    os.environ["TRACE_DB_PATH"] = DB_PATH
+    for suffix in ("", "-wal", "-shm"):
+        p = pathlib.Path(DB_PATH + suffix)
+        if p.exists():
+            p.unlink()
     reset_settings_cache()
     with TestClient(app) as c:
         yield c

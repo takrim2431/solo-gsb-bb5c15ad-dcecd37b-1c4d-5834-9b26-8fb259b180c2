@@ -4,15 +4,19 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Query
+from fastapi import status as http_status
 
-from . import service
+from . import audit, service
 from .database import get_conn
 from .errors import ApiError
 from .models import (
+    AuditPackageRequest,
     CertCorrectRequest,
     CertIssueRequest,
     CertRevokeRequest,
     ReadingSubmitRequest,
+    UtcDatetime,
+    to_utc_string,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["traceability"])
@@ -140,4 +144,56 @@ def get_request(request_id: str) -> dict:
         if out is None:
             raise ApiError(404, "unknown_request",
                            f"request_id {request_id!r} not found")
+        return out
+
+
+# ---------------- 审计取证追溯包
+
+@router.post("/audit/packages", status_code=http_status.HTTP_201_CREATED)
+def create_audit_package(req: AuditPackageRequest) -> dict:
+    """按 设备编号 + 半开测量时间区间 + 已提交版本 生成（或幂等复用）追溯包。"""
+    return audit.create_audit_package(req.model_dump())
+
+
+@router.get("/audit/packages/find")
+def find_audit_package(
+    device_no: str = Query(min_length=1, max_length=128),
+    time_from: UtcDatetime = Query(),
+    time_to: UtcDatetime = Query(),
+    at_version: int = Query(ge=1),
+) -> dict:
+    """按筛选条件+版本定位既有追溯包；不存在返回 404，不会隐式生成。"""
+    if time_from >= time_to:
+        raise ApiError(
+            422, "invalid_time_interval",
+            "time_from must be earlier than time_to (half-open interval [time_from, time_to))",
+        )
+    out = audit.find_audit_package(
+        device_no, to_utc_string(time_from), to_utc_string(time_to), at_version
+    )
+    if out is None:
+        raise ApiError(404, "unknown_package", "no audit package for the given criteria")
+    out["reused"] = True
+    return out
+
+
+@router.get("/audit/packages/{package_id}")
+def get_audit_package(package_id: str) -> dict:
+    """追溯包清单：筛选条件、版本、总条数、分段表与可复算完整性摘要。"""
+    with get_conn() as conn:
+        out = audit.get_audit_package(conn, package_id)
+        if out is None:
+            raise ApiError(404, "unknown_package",
+                           f"audit package {package_id!r} not found")
+        return out
+
+
+@router.get("/audit/packages/{package_id}/segments/{segment_index}")
+def get_audit_segment(package_id: str, segment_index: int) -> dict:
+    """分段获取冻结条目；段号从 0 起，拼接全部段即可无遗漏、无重复地复原整包。"""
+    with get_conn() as conn:
+        out = audit.get_audit_segment(conn, package_id, segment_index)
+        if out is None:
+            raise ApiError(404, "unknown_package",
+                           f"audit package {package_id!r} not found")
         return out

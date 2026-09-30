@@ -65,6 +65,33 @@ CREATE TABLE IF NOT EXISTS readings (
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_readings_device_time ON readings(device_no, measured_at);
+
+-- 审计取证追溯包主档（只追加；相同 设备+半开时间区间+版本 幂等复用）
+-- 生成追溯包不属于领域变更，不占用 versions 表的全局版本号
+CREATE TABLE IF NOT EXISTS audit_packages (
+    package_id        TEXT PRIMARY KEY,
+    device_no         TEXT NOT NULL,
+    time_from         TEXT NOT NULL,   -- 含（左闭）
+    time_to           TEXT NOT NULL,   -- 不含（右开）
+    at_version        INTEGER NOT NULL,
+    page_size         INTEGER NOT NULL,
+    total_count       INTEGER NOT NULL,
+    entries_digest    TEXT NOT NULL,   -- 全部分段条目拼接后的 SHA-256
+    package_digest    TEXT NOT NULL,   -- 规范化清单 canonical_json 的 SHA-256
+    canonical_json    TEXT NOT NULL,   -- 规范化清单原文（可独立复算 package_digest）
+    created_at        TEXT NOT NULL
+);
+-- 同筛选条件+版本只允许有一个包：保证内容与摘要一致
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_pkg_filter
+    ON audit_packages(device_no, time_from, time_to, at_version);
+
+-- 追溯包内读数条目快照（创建时冻结，之后不再变更）
+CREATE TABLE IF NOT EXISTS audit_package_entries (
+    package_id    TEXT NOT NULL REFERENCES audit_packages(package_id),
+    seq           INTEGER NOT NULL,    -- 从 0 起的全局稳定序号
+    entry_json    TEXT NOT NULL,       -- 规范化条目 JSON（段摘要的哈希输入）
+    PRIMARY KEY (package_id, seq)
+);
 """
 
 
