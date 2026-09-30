@@ -224,6 +224,80 @@ curl -s http://localhost:8080/api/v1/health
 curl -s http://localhost:8080/api/v1/status
 ```
 
+### 8. 审计取证追溯包
+
+按**设备编号 + 带时区测量时间左闭右开区间 + 已提交版本**生成取证包（只读，不产生新版本）。包内只收录该版本**之前（含该版本）已提交**的读数，每条给出在该版本视角的结论 `status` 与**全部候选证书快照** `candidates`。
+
+```bash
+curl -s -G http://localhost:8080/api/v1/audit/packages \
+  --data-urlencode 'device_no=DEV-A' \
+  --data-urlencode 'measured_from=2026-01-01T00:00:00Z' \
+  --data-urlencode 'measured_to=2026-07-01T00:00:00Z' \
+  --data-urlencode 'at_version=5' \
+  --data-urlencode 'limit=50' \
+  --data-urlencode 'offset=0'
+```
+
+返回（节选）：
+
+```json
+{
+  "package_id": "cf35d7dd...",
+  "filter": {
+    "device_no": "DEV-A",
+    "measured_from": "2026-01-01T00:00:00.000000Z",
+    "measured_to":   "2026-07-01T00:00:00.000000Z",
+    "at_version": 5
+  },
+  "at_version": 5,
+  "total_count": 3,
+  "segment": {"limit": 50, "offset": 0, "count": 3, "has_more": false,
+              "order": ["measured_at ASC", "reading_no ASC"]},
+  "items": [
+    {
+      "reading_no": "M-1", "device_no": "DEV-A",
+      "measured_at": "2026-03-01T10:00:00.000000Z", "value": 42.0,
+      "submitted_at_version": 2,
+      "status": "conforming",
+      "reliance": { "certificate_no": "CERT-001", "version_seq": 1, "...": "..." },
+      "candidates": [ { "certificate_no": "CERT-001", "version_seq": 1, "...": "..." } ]
+    }
+  ],
+  "digest": {
+    "algorithm": "sha256",
+    "spec_version": "audit-v1",
+    "package_digest": "29773bbf...",
+    "package_digest_input": { "canonical_json": "{...规范化后的完整包...}" },
+    "segment_digest": "ab12...",
+    "segment_digest_input": { "canonical_json": "{...本分段...}" },
+    "canonical_rules": { "...": "随包返回的摘要规范化规则，可据其独立复算" }
+  }
+}
+```
+
+要点：
+
+- **无匹配读数返回空包**（`200`，`total_count=0`、`items=[]`，摘要照常给出）；不存在的设备同样返回空包而非 404。
+- **版本越界**（`at_version<1` 或 `>当前版本`）、**无效时间区间**（含缺时区、起点 ≥ 终点）一律 `422`，不读取数据、不产生半成品。
+- 大量条目用 `limit`（≤200）/`offset` 分段；固定按 `(measured_at ASC, reading_no ASC)` 排序，拼接无遗漏、无重复。各分段的 `package_id` 与 `package_digest` 完全一致（包摘要始终覆盖全部 `total_count` 条），另给 `segment_digest` 校验本分段。
+- 包生成在单一只读快照事务内完成；生成期间发生的新提交、证书纠正或撤销对该次取证不可见，且因只收录 `submitted_at_version <= at_version` 的读数、结论按 `at_version` 视角评估，**相同条件 + 版本的内容与摘要在任何时刻重取都一致**。
+
+独立复算摘要（任何语言均可）：
+
+```bash
+# package_digest = lower(hex(sha256(package_digest_input.canonical_json)))
+python3 - <<'PY'
+import hashlib, json, urllib.parse, urllib.request
+q = urllib.parse.urlencode({
+    "device_no": "DEV-A", "measured_from": "2026-01-01T00:00:00Z",
+    "measured_to": "2026-07-01T00:00:00Z", "at_version": 5})
+b = json.load(urllib.request.urlopen("http://localhost:8080/api/v1/audit/packages?" + q))
+s = b["digest"]["package_digest_input"]["canonical_json"]
+print("recomputed:", hashlib.sha256(s.encode("utf-8")).hexdigest())
+print("matches:   ", hashlib.sha256(s.encode("utf-8")).hexdigest() == b["digest"]["package_digest"])
+PY
+```
+
 ---
 
 ## 六、HTTP 接口一览
@@ -241,6 +315,7 @@ curl -s http://localhost:8080/api/v1/status
 | GET  | `/api/v1/readings/{reading_no}` | 读数结论（默认当前版本，`at_version` 查历史） |
 | GET  | `/api/v1/versions` | 全局单调版本流水 |
 | GET  | `/api/v1/requests/{request_id}` | 按请求标识追溯 |
+| GET  | `/api/v1/audit/packages` | 审计取证追溯包（设备 + 左闭右开时间区间 + 版本） |
 | GET  | `/api/v1/health` | 健康检查 |
 
 主要状态码：`200` 成功；`404` 未知目标（证书 / 读数 / 请求）；`409` 请求标识冲突、证书已存在 / 已撤销、读数已存在；`422` 参数校验失败（含无效时间区间、范围倒置、缺时区等）。
@@ -254,6 +329,7 @@ curl -s http://localhost:8080/api/v1/status
 - **版本视角查询**：证书在版本 V 有效 ⇔ 其内容版本 `created_at_version <= V` 且（`superseded_at_version` 为空或 `> V`），且测量时刻落在 `[valid_from, valid_to)`。
 - **事务与并发**：所有写操作在单条 `BEGIN IMMEDIATE` 事务内完成「幂等判定 → 业务校验 → 落库」，任何错误整体回滚；WAL 模式支持读写并发。
 - **幂等指纹**：对归一化（UTC 化）后的请求体做排序 JSON 指纹；相同 `request_id` + 指纹返回首次响应，`request_id` 复用且指纹不同则拒绝。
+- **审计取证包**：`GET /audit/packages` 在单一只读快照事务（WAL `BEGIN` 读快照）内完成筛选与评估，事务开始后的提交一律不可见；逻辑上再叠加 `submitted_at_version <= at_version` 与测量时间 `[from, to)` 双重过滤。候选证书快照做版本视角投影——`superseded_at_version` 晚于取证版本时投影为 `null`，使历史版本包不携带"未来"事件。包摘要 `sha256(canonical_json(...))` 覆盖固定键集合下的全部条目（与分页无关），`package_id` 为筛选条件 + 版本规范化哈希的前 32 位；规范化规则（键排序、无空白、UTC 定长时间、binary64 最短往返数字、条目排序）随包返回，支持独立复算。
 
 ---
 

@@ -8,12 +8,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .database import get_conn, write_tx
+from .database import get_conn, read_tx, write_tx
 from .errors import ApiError
 from .models import UTC_FMT, to_utc_string
 
@@ -658,4 +659,253 @@ def get_request(conn: sqlite3.Connection, request_id: str) -> Optional[Dict[str,
         "request_payload": json.loads(row["request_payload_json"]),
         "response": json.loads(row["response_json"]) if row["response_json"] else None,
         "created_at": row["created_at"],
+    }
+
+
+# ---------------------------------------------------------------- 审计取证包
+
+# 取证摘要算法版本：摘要规范化规则一旦变化即升版本，避免新旧摘要混淆。
+AUDIT_DIGEST_ALGORITHM = "sha256"
+AUDIT_DIGEST_SPEC_VERSION = "audit-v1"
+
+
+def _cert_snapshot_as_of(row: sqlite3.Row, at_version: int) -> Dict[str, Any]:
+    """证书快照在版本视角 at_version 下的投影。
+
+    与 ``_cert_snapshot`` 的唯一差别：失效版本若晚于取证版本（属于"未来"
+    的纠正 / 撤销），投影为 None，保证历史版本视角的快照不携带版本之后
+    才发生的事件，从而做到同条件同版本内容永远一致。
+    """
+    snap = _cert_snapshot(row)
+    if snap["superseded_at_version"] is not None and snap["superseded_at_version"] > at_version:
+        snap["superseded_at_version"] = None
+    return snap
+
+
+def _evaluate_reading_as_of(
+    conn: sqlite3.Connection,
+    device_no: str,
+    measured_at: str,
+    value: float,
+    at_version: int,
+) -> Dict[str, Any]:
+    """版本视角下评估读数，候选证书快照统一做 as-of 投影。"""
+    matches = _active_cert_rows(conn, device_no, at_version, measured_at)
+    if not matches:
+        return {"status": "unverified", "reliance": None, "candidates": []}
+    candidates = [_cert_snapshot_as_of(m, at_version) for m in matches]
+    if len(matches) > 1:
+        return {"status": "review", "reliance": None, "candidates": candidates}
+    status = (
+        "conforming"
+        if matches[0]["min_value"] <= value <= matches[0]["max_value"]
+        else "out_of_range"
+    )
+    return {"status": status, "reliance": candidates[0], "candidates": candidates}
+
+
+def _audit_canonical_rules() -> Dict[str, Any]:
+    """摘要规范化规则（随包返回，可据其独立复算）。"""
+    return {
+        "spec_version": AUDIT_DIGEST_SPEC_VERSION,
+        "hash_algorithm": AUDIT_DIGEST_ALGORITHM,
+        "text_encoding": "utf-8",
+        "json_rules": (
+            "RFC 8785 风格的规范化 JSON：对象键按 Unicode 码位字典序升序，"
+            "分隔符为冒号/逗号且无任何多余空白；不输出枚举以外的键；"
+            "ensure_ascii=false 后按 UTF-8 编码入哈希。"
+        ),
+        "datetime_rules": (
+            "全部时间归一化为 UTC 定长字符串 YYYY-MM-DDTHH:MM:SS.ffffffZ"
+            "（微秒不足 6 位左侧补 0，末尾固定 Z）；测量区间为左闭右开。"
+        ),
+        "number_rules": (
+            "数值为 JSON number，采用 IEEE 754 binary64 的最短往返十进制文本"
+            "（Python repr / json.dumps 的 float 输出；整数如 10 输出 10.0"
+            "与否取决于存储类型，服务端 REAL 统一按 float 渲染）。"
+        ),
+        "item_order": (
+            "条目固定按 (measured_at UTC 升序, reading_no 升序) 排列，"
+            "与分段 limit/offset 无关；包摘要始终覆盖全部 total_count 条。"
+        ),
+        "candidate_rules": (
+            "candidates 按 (certificate_no 升序, version_seq 升序) 排列；"
+            "证书快照为取证版本视角投影：created_at_version<=at_version 才可见，"
+            "且 superseded_at_version 晚于 at_version 时投影为 null。"
+        ),
+        "package_digest_input": (
+            "package_digest = lower(hex(sha256(canonical_json(canonical_package))))，"
+            "canonical_package 的结构与字段见包体 digest.canonical_package 说明；"
+            "该结构只含查询条件、版本与全部条目，不含生成时刻、服务版本等易变量。"
+        ),
+        "segment_digest_input": (
+            "segment_digest = lower(hex(sha256(canonical_json({"
+            "'spec_version','package_id','package_digest','at_version',"
+            "'limit','offset','items'})))，items 为本分段条目，"
+            "条目对象与包摘要所用完全一致。"
+        ),
+        "package_id_rule": (
+            "package_id = lower(hex(sha256(canonical_json({"
+            "'device_no','measured_from','measured_to','at_version'})))"
+            " 的前 32 个十六进制字符；同条件同版本恒定。"
+        ),
+    }
+
+
+def _audit_filter_object(
+    device_no: str, measured_from: str, measured_to: str, at_version: int
+) -> Dict[str, Any]:
+    return {
+        "device_no": device_no,
+        "measured_from": measured_from,
+        "measured_to": measured_to,
+        "at_version": at_version,
+    }
+
+
+def _audit_item(conn: sqlite3.Connection, r: sqlite3.Row, at_version: int) -> Dict[str, Any]:
+    conclusion = _evaluate_reading_as_of(
+        conn, r["device_no"], r["measured_at"], r["value"], at_version
+    )
+    return {
+        "reading_no": r["reading_no"],
+        "device_no": r["device_no"],
+        "measured_at": r["measured_at"],
+        "value": r["value"],
+        "submitted_at_version": r["submitted_at_version"],
+        "status": conclusion["status"],
+        "reliance": conclusion["reliance"],
+        "candidates": conclusion["candidates"],
+    }
+
+
+def build_audit_package(
+    device_no: str,
+    measured_from: Any,
+    measured_to: Any,
+    at_version: int,
+    limit: int,
+    offset: int,
+) -> Dict[str, Any]:
+    """生成审计取证追溯包（只读，不改任何数据）。
+
+    筛选：指定设备、测量时间落入 [measured_from, measured_to)（左闭右开）、
+    且在 at_version 版本之前（含该版本）已提交的读数；
+    每条读数给出在 at_version 版本视角的结论与全部候选证书快照。
+
+    版本越界 / 无效区间在进入任何数据读取前即报错（422），不产生半成品；
+    无匹配读数时返回空包（total_count=0、items=[]，摘要照常给出）。
+    """
+    # 无效区间先于一切数据库访问明确报错
+    if measured_from.tzinfo is None or measured_to.tzinfo is None:
+        raise ApiError(
+            422,
+            "missing_timezone",
+            "measured_from and measured_to must include a timezone, e.g. 2026-01-01T00:00:00Z",
+        )
+    mfrom = to_utc_string(measured_from)
+    mto = to_utc_string(measured_to)
+    if mfrom >= mto:
+        raise ApiError(
+            422,
+            "invalid_time_range",
+            "measured_from must be earlier than measured_to (half-open interval)",
+        )
+
+    # 单一只读快照事务：事务开始后的任何新提交 / 纠正 / 撤销在本事务内不可见
+    with read_tx() as conn:
+        av = _resolve_at_version(conn, at_version)
+
+        filter_obj = _audit_filter_object(device_no, mfrom, mto, av)
+        package_id = hashlib.sha256(
+            canonical_json(filter_obj).encode("utf-8")
+        ).hexdigest()[:32]
+
+        where_sql = (
+            "device_no = ?"
+            " AND submitted_at_version <= ?"
+            " AND measured_at >= ?"
+            " AND measured_at < ?"
+        )
+        where_params: List[Any] = [device_no, av, mfrom, mto]
+        order_sql = " ORDER BY measured_at, reading_no"
+
+        total_count = int(conn.execute(
+            f"SELECT COUNT(*) AS c FROM readings WHERE {where_sql}", where_params
+        ).fetchone()["c"])
+
+        # 包摘要覆盖全部条目（与分段无关）：稳定排序后逐段取出评估
+        all_items: List[Dict[str, Any]] = []
+        page = 200
+        for page_offset in range(0, total_count, page):
+            rows = conn.execute(
+                f"SELECT * FROM readings WHERE {where_sql}{order_sql} LIMIT ? OFFSET ?",
+                (*where_params, page, page_offset),
+            ).fetchall()
+            all_items.extend(_audit_item(conn, r, av) for r in rows)
+
+        canonical_package = {
+            "spec_version": AUDIT_DIGEST_SPEC_VERSION,
+            "filter": filter_obj,
+            "at_version": av,
+            "total_count": total_count,
+            "items": all_items,
+        }
+        package_digest = hashlib.sha256(
+            canonical_json(canonical_package).encode("utf-8")
+        ).hexdigest()
+
+        segment_rows = conn.execute(
+            f"SELECT * FROM readings WHERE {where_sql}{order_sql} LIMIT ? OFFSET ?",
+            (*where_params, limit, offset),
+        ).fetchall()
+        items = [_audit_item(conn, r, av) for r in segment_rows]
+
+    segment_input = {
+        "spec_version": AUDIT_DIGEST_SPEC_VERSION,
+        "package_id": package_id,
+        "package_digest": package_digest,
+        "at_version": av,
+        "limit": limit,
+        "offset": offset,
+        "items": items,
+    }
+    segment_digest = hashlib.sha256(
+        canonical_json(segment_input).encode("utf-8")
+    ).hexdigest()
+
+    return {
+        "package_id": package_id,
+        "filter": filter_obj,
+        "at_version": av,
+        "total_count": total_count,
+        "segment": {
+            "limit": limit,
+            "offset": offset,
+            "count": len(items),
+            "has_more": offset + len(items) < total_count,
+            "order": ["measured_at ASC", "reading_no ASC"],
+        },
+        "items": items,
+        "digest": {
+            "algorithm": AUDIT_DIGEST_ALGORITHM,
+            "spec_version": AUDIT_DIGEST_SPEC_VERSION,
+            "package_digest": package_digest,
+            "package_digest_input": {
+                "canonical_json": canonical_json(canonical_package),
+                "structure": [
+                    "spec_version",
+                    "filter{device_no,measured_from,measured_to,at_version}",
+                    "at_version",
+                    "total_count",
+                    "items[reading_no,device_no,measured_at,value,"
+                    "submitted_at_version,status,reliance,candidates]",
+                ],
+            },
+            "segment_digest": segment_digest,
+            "segment_digest_input": {
+                "canonical_json": canonical_json(segment_input),
+            },
+            "canonical_rules": _audit_canonical_rules(),
+        },
     }

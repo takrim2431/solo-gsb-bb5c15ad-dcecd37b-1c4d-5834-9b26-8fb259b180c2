@@ -103,6 +103,26 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
+def read_tx() -> Iterator[sqlite3.Connection]:
+    """请求级一致性只读快照事务（WAL deferred）。
+
+    事务内所有 SELECT 共享同一读快照：事务开始后其他连接的提交
+    （新读数提交、证书纠正 / 撤销）在本事务内一律不可见，
+    保证一次取证包生成过程读到的是同一个数据库状态。
+    """
+    conn = _connect(get_settings().db_path)
+    try:
+        conn.execute("BEGIN")  # 延迟事务，首次 SELECT 时确立 WAL 读快照
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
 def write_tx() -> Iterator[sqlite3.Connection]:
     """串行化写事务：BEGIN IMMEDIATE 立刻获取 RESERVED 锁，
     避免并发写在升级锁时发生死锁；异常自动回滚。"""

@@ -1,6 +1,8 @@
 """端到端测试：通过 TestClient 覆盖全部业务规则。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import pathlib
 
@@ -403,3 +405,355 @@ def test_10_timezone_normalization(client):
         }],
     })
     assert r.json()["results"][0]["status"] == "conforming"
+
+
+# ---------------- 审计取证追溯包
+
+
+def _canon(obj) -> str:
+    """与服务端相同的规范化序列化，用于独立复算摘要。"""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sha(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _fetch_all_pages(client, params):
+    """以固定 limit 翻页取全量，按返回顺序拼接条目与页码信息。"""
+    page_size = 2
+    seen = []
+    pages = []
+    offset = 0
+    while True:
+        body = client.get(f"{API}/audit/packages",
+                          params={**params, "limit": page_size, "offset": offset}).json()
+        pages.append(body)
+        seen.extend(body["items"])
+        if not body["segment"]["has_more"]:
+            break
+        offset += page_size
+    return pages, seen
+
+
+def test_11_audit_package_basic_and_digest(client):
+    # 独立设备 DA：证书覆盖 2026-03，允许值 [0, 10]
+    r = client.post(f"{API}/certificates", json={
+        "request_id": "req-aud-cert",
+        "certificate_no": "CERT-AUD", "device_no": "DA",
+        "valid_from": "2026-03-01T00:00:00Z",
+        "valid_to": "2026-04-01T00:00:00Z",
+        "min_value": 0.0, "max_value": 10.0,
+    })
+    assert r.status_code == 200
+    cert_v = r.json()["version"]
+
+    r = client.post(f"{API}/readings", json={
+        "request_id": "req-aud-reads",
+        "readings": [
+            {"reading_no": "A1", "device_no": "DA",
+             "measured_at": "2026-03-02T00:00:00Z", "value": 5.0},
+            {"reading_no": "A2", "device_no": "DA",
+             "measured_at": "2026-03-03T00:00:00Z", "value": 50.0},
+            {"reading_no": "A3", "device_no": "DA",  # 区间右边界之外
+             "measured_at": "2026-04-01T00:00:00Z", "value": 5.0},
+            {"reading_no": "A4", "device_no": "DA",  # 区间左边界之前
+             "measured_at": "2026-02-28T23:59:59Z", "value": 5.0},
+        ],
+    })
+    assert r.status_code == 200
+    read_v = r.json()["version"]
+
+    params = {
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-04-01T00:00:00Z",
+        "at_version": read_v,
+    }
+    body = client.get(f"{API}/audit/packages", params=params).json()
+
+    # 只收录区间内（左闭右开）且该版本前已提交的读数
+    assert body["total_count"] == 2
+    assert [i["reading_no"] for i in body["items"]] == ["A1", "A2"]
+    # 排序稳定：measured_at 升序
+    assert body["segment"]["order"] == ["measured_at ASC", "reading_no ASC"]
+
+    by_no = {i["reading_no"]: i for i in body["items"]}
+    assert by_no["A1"]["status"] == "conforming"
+    assert by_no["A1"]["reliance"]["certificate_no"] == "CERT-AUD"
+    assert by_no["A2"]["status"] == "out_of_range"
+    # 每条读数列出全部候选证书快照
+    assert [c["certificate_no"] for c in by_no["A1"]["candidates"]] == ["CERT-AUD"]
+    for i in body["items"]:
+        assert i["submitted_at_version"] == read_v
+
+    # 包标识与条件、版本绑定
+    expect_filter = {
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00.000000Z",
+        "measured_to": "2026-04-01T00:00:00.000000Z",
+        "at_version": read_v,
+    }
+    assert body["filter"] == expect_filter
+    expect_id = _sha(_canon(expect_filter))[:32]
+    assert body["package_id"] == expect_id
+
+    # 独立复算包摘要
+    canonical_package = {
+        "spec_version": body["digest"]["spec_version"],
+        "filter": expect_filter,
+        "at_version": read_v,
+        "total_count": 2,
+        "items": body["items"],
+    }
+    assert body["digest"]["package_digest"] == _sha(_canon(canonical_package))
+    # 服务端给出的输入串与客户端规范化结果一致（可完全独立复算）
+    assert body["digest"]["package_digest_input"]["canonical_json"] == _canon(canonical_package)
+    # 规范化规则随包记录
+    rules = body["digest"]["canonical_rules"]
+    assert rules["hash_algorithm"] == "sha256"
+    assert rules["spec_version"] == body["digest"]["spec_version"]
+    assert "utf-8" in rules["text_encoding"]
+
+    # 同条件同版本：内容与摘要恒定（先记住，撤销证书后再次拉取对比）
+    digest_before = body["digest"]["package_digest"]
+    segment_digest_before = body["digest"]["segment_digest"]
+    items_before = body["items"]
+
+    # 撤销证书（取证版本之后发生的新事件）
+    r = client.post(f"{API}/certificates/CERT-AUD/revoke", json={
+        "request_id": "req-aud-revoke",
+        "certificate_no": "CERT-AUD",
+        "reason": "audit scenario",
+    })
+    assert r.status_code == 200
+    revoke_v = r.json()["version"]
+    assert revoke_v > read_v
+
+    again = client.get(f"{API}/audit/packages", params=params).json()
+    # 不混入撤销：同一版本视角的条目、结论、候选快照与摘要完全一致
+    assert again["digest"]["package_digest"] == digest_before
+    assert again["digest"]["segment_digest"] == segment_digest_before
+    assert again["items"] == items_before
+    assert again["package_id"] == expect_id
+
+    # 当前版本视角（撤销后）则结论改变，证明 as-of 隔离确实生效
+    cur = client.get(f"{API}/audit/packages", params={**params, "at_version": revoke_v}).json()
+    assert cur["digest"]["package_digest"] != digest_before
+    assert {i["reading_no"]: i["status"] for i in cur["items"]} == {
+        "A1": "unverified", "A2": "unverified",
+    }
+    assert cur["items"][0]["candidates"] == []
+
+    # at_version 早于证书签发：读数当时已提交但无证书可见 -> 空候选 unverified
+    early = client.get(f"{API}/audit/packages",
+                       params={**params, "at_version": cert_v}).json()
+    # cert_v 时读数尚未提交（submitted_at_version=read_v > cert_v）-> 空包
+    assert early["total_count"] == 0 and early["items"] == []
+
+
+def test_12_audit_version_isolation_readings_committed_after_excluded(client):
+    # 先取 read_v 版本的包，再在区间内补提新读数、纠正证书；旧版本包不得混入
+    r = client.post(f"{API}/readings", json={
+        "request_id": "req-aud-late-read",
+        "readings": [{
+            "reading_no": "A5", "device_no": "DA",
+            "measured_at": "2026-03-04T00:00:00Z", "value": 5.0,
+        }],
+    })
+    assert r.status_code == 200
+    # 证书已撤销 -> 当前视角 unverified；但旧版本包不受影响
+    status = client.get(f"{API}/status").json()["current_version"]
+
+    # 找到 test_11 的读数提交版本（A1 详情）
+    a1 = client.get(f"{API}/readings/A1").json()
+    read_v = a1["submitted_at_version"]
+    params = {
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-04-01T00:00:00Z",
+        "at_version": read_v,
+    }
+    body = client.get(f"{API}/audit/packages", params=params).json()
+    assert body["total_count"] == 2
+    assert "A5" not in {i["reading_no"] for i in body["items"]}
+    assert status > read_v  # 数据库确有更新版本，证明是 as-of 过滤而非没有新提交
+
+
+def test_13_audit_pagination_stable_concat_and_segment_digest(client):
+    # 再制造多条同设备区间内读数用于翻页（先重新签发证书，让读数有候选）
+    r = client.post(f"{API}/certificates", json={
+        "request_id": "req-aud-cert2",
+        "certificate_no": "CERT-AUD2", "device_no": "DA",
+        "valid_from": "2026-03-01T00:00:00Z",
+        "valid_to": "2026-04-01T00:00:00Z",
+        "min_value": 0.0, "max_value": 10.0,
+    })
+    cert2_v = r.json()["version"]
+    r = client.post(f"{API}/readings", json={
+        "request_id": "req-aud-pages",
+        "readings": [
+            {"reading_no": "P1", "device_no": "DA",
+             "measured_at": "2026-03-05T00:00:00Z", "value": 1.0},
+            {"reading_no": "P2", "device_no": "DA",
+             "measured_at": "2026-03-05T00:00:00Z", "value": 2.0},  # 同一时刻按 reading_no
+            {"reading_no": "P3", "device_no": "DA",
+             "measured_at": "2026-03-06T00:00:00Z", "value": 3.0},
+        ],
+    })
+    pages_v = r.json()["version"]
+
+    params = {
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-04-01T00:00:00Z",
+        "at_version": pages_v,
+    }
+    pages, concat_items = _fetch_all_pages(client, params)
+
+    full = client.get(f"{API}/audit/packages",
+                      params={**params, "limit": 200, "offset": 0}).json()
+
+    # 无遗漏、无重复、顺序稳定
+    assert full["total_count"] == len(concat_items)
+    nos = [i["reading_no"] for i in concat_items]
+    assert len(nos) == len(set(nos))
+    assert concat_items == full["items"]
+    # 同一时刻按 reading_no 次序稳定
+    assert nos.index("P1") < nos.index("P2") < nos.index("P3")
+
+    # 各分段 package_id / package_digest 完全一致（与分页无关）
+    assert len(pages) >= 2
+    assert {p["package_id"] for p in pages} == {full["package_id"]}
+    assert {p["digest"]["package_digest"] for p in pages} == {full["digest"]["package_digest"]}
+
+    # 每段的 segment_digest 可按规范化规则独立复算
+    for p in pages:
+        seg_input = {
+            "spec_version": p["digest"]["spec_version"],
+            "package_id": p["package_id"],
+            "package_digest": p["digest"]["package_digest"],
+            "at_version": p["at_version"],
+            "limit": p["segment"]["limit"],
+            "offset": p["segment"]["offset"],
+            "items": p["items"],
+        }
+        assert p["digest"]["segment_digest"] == _sha(_canon(seg_input))
+
+    # 再次翻页：分段摘要同样稳定（新提交不影响历史版本包）
+    pages2, _ = _fetch_all_pages(client, params)
+    assert [p["digest"]["segment_digest"] for p in pages2] == [
+        p["digest"]["segment_digest"] for p in pages
+    ]
+
+
+def test_14_audit_empty_package_has_digest(client):
+    # 设备存在但区间无读数：空包，摘要照常且可复算
+    params = {
+        "device_no": "DA",
+        "measured_from": "2030-01-01T00:00:00Z",
+        "measured_to": "2030-02-01T00:00:00Z",
+        "at_version": client.get(f"{API}/status").json()["current_version"],
+    }
+    body = client.get(f"{API}/audit/packages", params=params).json()
+    assert body["total_count"] == 0 and body["items"] == []
+    assert body["segment"]["has_more"] is False
+    canonical_package = {
+        "spec_version": body["digest"]["spec_version"],
+        "filter": body["filter"],
+        "at_version": body["at_version"],
+        "total_count": 0,
+        "items": [],
+    }
+    assert body["digest"]["package_digest"] == _sha(_canon(canonical_package))
+
+    # 从未出现过的设备同样是空包（不是 404）
+    body2 = client.get(f"{API}/audit/packages", params={**params, "device_no": "NO-SUCH-DEV"}).json()
+    assert body2["total_count"] == 0 and body2["package_id"] != body["package_id"]
+
+
+def test_15_audit_half_open_and_timezone_inputs(client):
+    # 取一个已知版本
+    v = client.get(f"{API}/status").json()["current_version"]
+    base = {
+        "device_no": "DA",
+        "at_version": v,
+    }
+    # 右边界开区间：2026-04-01T00:00:00Z 时刻的读数不收录
+    b1 = client.get(f"{API}/audit/packages", params={
+        **base,
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-04-01T00:00:00Z",
+    }).json()
+    b2 = client.get(f"{API}/audit/packages", params={
+        **base,
+        "measured_from": "2026-03-01T08:00:00+08:00",   # == 2026-03-01T00:00:00Z
+        "measured_to": "2026-04-01T08:00:00+08:00",     # == 2026-04-01T00:00:00Z
+    }).json()
+    # 时区写法不同但归一化后等价：包与摘要一致
+    assert b2["filter"] == b1["filter"]
+    assert b2["package_id"] == b1["package_id"]
+    assert b2["digest"]["package_digest"] == b1["digest"]["package_digest"]
+    assert all(i["measured_at"] < b1["filter"]["measured_to"] for i in b1["items"])
+
+
+def test_16_audit_errors(client):
+    latest = client.get(f"{API}/status").json()["current_version"]
+
+    # 版本越界
+    r = client.get(f"{API}/audit/packages", params={
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-04-01T00:00:00Z",
+        "at_version": latest + 1,
+    })
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_version"
+
+    r = client.get(f"{API}/audit/packages", params={
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-04-01T00:00:00Z",
+        "at_version": 0,
+    })
+    assert r.status_code == 422  # Query(ge=1)
+
+    # 无效时间区间：起点 == 终点（零宽度）
+    r = client.get(f"{API}/audit/packages", params={
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-03-01T00:00:00Z",
+        "at_version": latest,
+    })
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_time_range"
+
+    # 起点晚于终点
+    r = client.get(f"{API}/audit/packages", params={
+        "device_no": "DA",
+        "measured_from": "2026-04-01T00:00:00Z",
+        "measured_to": "2026-03-01T00:00:00Z",
+        "at_version": latest,
+    })
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_time_range"
+
+    # 缺时区
+    r = client.get(f"{API}/audit/packages", params={
+        "device_no": "DA",
+        "measured_from": "2026-03-01 00:00:00",
+        "measured_to": "2026-04-01T00:00:00Z",
+        "at_version": latest,
+    })
+    assert r.status_code == 422
+
+    # 缺必填参数
+    r = client.get(f"{API}/audit/packages", params={
+        "device_no": "DA",
+        "measured_from": "2026-03-01T00:00:00Z",
+        "measured_to": "2026-04-01T00:00:00Z",
+    })
+    assert r.status_code == 422
+
+    # 报错后没有任何半成品：服务仍可用、当前版本不变
+    assert client.get(f"{API}/status").json()["current_version"] == latest
